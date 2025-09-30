@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 import time
 
 class MicroLiquidityHunter:
-    def __init__(self, initial_balance=20, api_key=None, api_secret=None):
+    def __init__(self, initial_balance : float = 20, api_key=None, api_secret=None, 
+                 max_loss_percent : float =5, take_profit_percent : float = 1, early_take_profit_percent : float =1):
         # Инициализация клиента Binance (можно без ключей для публичных данных)
         if api_key and api_secret:
             self.client = Client(api_key, api_secret)
@@ -18,6 +19,11 @@ class MicroLiquidityHunter:
         self.trades = []
         self.consecutive_losses = 0
         self.portfolio = {}
+        
+        # НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
+        self.max_loss_percent = max_loss_percent  # Максимальный убыток в %
+        self.take_profit_percent = take_profit_percent  # Основной тейк-профит в %
+        self.early_take_profit_percent = early_take_profit_percent  # Ранний тейк-профит в %
         
     def get_real_market_data(self, symbol, timeframe='1m', lookback=500):
         """Получаем РЕАЛЬНЫЕ данные с Binance"""
@@ -52,9 +58,22 @@ class MicroLiquidityHunter:
             print(f"Ошибка получения цены для {symbol}: {e}")
             return None
     
-    def wait_for_price_movement(self, symbol, entry_price, stop_loss, take_profit, signal, max_wait_minutes=60):
-        """Ожидаем реального движения цены до тейк-профита или стоп-лосса"""
+    def calculate_price_from_pnl(self, entry_price, pnl_percent, signal):
+        """Рассчитывает цену на основе PnL процента"""
+        if signal == 'BUY':
+            return entry_price * (1 + pnl_percent / 100)
+        else:  # SELL
+            return entry_price * (1 - pnl_percent / 100)
+    
+    def wait_for_price_movement(self, symbol, entry_price, signal, max_wait_minutes=60):
+        """Ожидаем реального движения цены до тейк-профита или стоп-лосса на основе PnL"""
         print(f"   ⏳ Ожидание движения цены... (макс. {max_wait_minutes} минут)")
+        print(f"   ⚙️ Настройки: SL -{self.max_loss_percent}% | TP +{self.take_profit_percent}% | Early TP +{self.early_take_profit_percent}%")
+        
+        # РАССЧИТЫВАЕМ ЦЕНЫ ИЗ PnL ПРОЦЕНТОВ
+        stop_loss_price = self.calculate_price_from_pnl(entry_price, -self.max_loss_percent, signal)
+        take_profit_price = self.calculate_price_from_pnl(entry_price, self.take_profit_percent, signal)
+        early_take_profit_price = self.calculate_price_from_pnl(entry_price, self.early_take_profit_percent, signal)
         
         start_time = datetime.now()
         end_time = start_time + timedelta(minutes=max_wait_minutes)
@@ -73,42 +92,37 @@ class MicroLiquidityHunter:
                 else:
                     current_pnl_percent = (entry_price - current_price) / entry_price * 100
                 
-                # 🔥 ДОБАВЛЯЕМ PnL-СТОПЫ 🔥
+                # ДЕБАГ: выводим все значения для анализа
+                print(f"   📊 Цена: {current_price:.4f} | PnL: {current_pnl_percent:+.2f}% | TP: {take_profit_price:.4f} | SL: {stop_loss_price:.4f}", end='\r')
                 
-                # 🚨 МАКСИМАЛЬНЫЙ УБЫТОК -5%
-                if current_pnl_percent <= -5:
-                    print(f"   🚨 СТОП ПО УБЫТКУ! PnL: {current_pnl_percent:.2f}%")
+                # 🔥 ПРОВЕРЯЕМ УСЛОВИЯ ВЫХОДА ПО PnL 🔥
+                
+                # 1. 🚨 МАКСИМАЛЬНЫЙ УБЫТОК
+                if current_pnl_percent <= -self.max_loss_percent:
+                    print(f"\n   🚨 СТОП ПО УБЫТКУ! PnL: {current_pnl_percent:.2f}%")
                     return current_price, 'PNL_STOP'
                 
-                # 🎯 МИНИМАЛЬНАЯ ПРИБЫЛЬ +1% (если хочешь гарантировать прибыль)
-                target_pnl_percent = (take_profit / entry_price - 1) * 100 if signal == 'BUY' else (entry_price / take_profit - 1) * 100
-                if current_pnl_percent >= 1 and current_pnl_percent < target_pnl_percent:
-                    print(f"   🎯 РАННИЙ ТЕЙК! PnL: {current_pnl_percent:.2f}%")
-                    return current_price, 'EARLY_TP'
+                # 2. 🎯 РАННИЙ ТЕЙК ПРИ достижении early_take_profit_percent
+                if current_pnl_percent >= self.early_take_profit_percent:
+                    # Проверяем, не достигли ли мы уже основного TP
+                    if signal == 'BUY':
+                        tp_reached = current_price >= take_profit_price
+                    else:
+                        tp_reached = current_price <= take_profit_price
+                    
+                    if not tp_reached:
+                        print(f"\n   🎯 РАННИЙ ТЕЙК! PnL: {current_pnl_percent:.2f}%")
+                        return current_price, 'EARLY_TP'
                 
-                # Проверяем основные условия выхода
-                if signal == 'BUY':
-                    if current_price >= take_profit:
-                        print(f"   ✅ ТЕЙК-ПРОФИТ достигнут! Цена: {current_price:.4f}")
-                        return current_price, 'TP'
-                    elif current_price <= stop_loss:
-                        print(f"   ❌ СТОП-ЛОСС достигнут! Цена: {current_price:.4f}")
-                        return current_price, 'SL'
-                else:  # SELL
-                    if current_price <= take_profit:
-                        print(f"   ✅ ТЕЙК-ПРОФИТ достигнут! Цена: {current_price:.4f}")
-                        return current_price, 'TP'
-                    elif current_price >= stop_loss:
-                        print(f"   ❌ СТОП-ЛОСС достигнут! Цена: {current_price:.4f}")
-                        return current_price, 'SL'
-                
-                # Красивое отображение с обновлением строки
-                print(f"   📊 Текущая цена: {current_price:.4f} | PnL: {current_pnl_percent:+.2f}%", end='\r')
+                # 3. ОСНОВНОЙ ТЕЙК-ПРОФИТ
+                if current_pnl_percent >= self.take_profit_percent:
+                    print(f"\n   ✅ ТЕЙК-ПРОФИТ достигнут! PnL: {current_pnl_percent:.2f}%")
+                    return current_price, 'TP'
                 
                 time.sleep(5)  # Проверяем каждые 5 секунд
                 
             except Exception as e:
-                print(f"   ⚠️ Ошибка при отслеживании цены: {e}")
+                print(f"\n   ⚠️ Ошибка при отслеживании цены: {e}")
                 time.sleep(10)
         
         # Если время вышло, выходим по текущей цене
@@ -116,7 +130,8 @@ class MicroLiquidityHunter:
         if final_price is None:
             final_price = entry_price  # Если не удалось получить цену, используем входную
         
-        print(f"   ⏰ Время вышло. Выход по цене: {final_price:.4f}")
+        final_pnl = (final_price - entry_price) / entry_price * 100 if signal == 'BUY' else (entry_price - final_price) / entry_price * 100
+        print(f"\n   ⏰ Время вышло. Выход по цене: {final_price:.4f} | PnL: {final_pnl:+.2f}%")
         return final_price, 'TIME'
     
     def calculate_max_trade_size(self):
@@ -202,20 +217,28 @@ class MicroLiquidityHunter:
             return None
         
         entry_price = opportunity['entry']
-        stop_loss = opportunity['stop_loss']
-        take_profit = opportunity['take_profit']
         
         # РЕАЛЬНЫЙ РАСЧЕТ КОЛИЧЕСТВА
         quantity = trade_size / entry_price
         
         print(f"🔹 МИКРО-СДЕЛКА: {opportunity['symbol']} {opportunity['signal']}")
         print(f"   💰 Размер: ${trade_size:.2f} | Вход: {entry_price:.4f}")
-        print(f"   🛡️ Стоп-лосс: {stop_loss:.4f} | 🎯 Тейк-профит: {take_profit:.4f}")
+        print(f"   ⚙️ Настройки риска: SL -{self.max_loss_percent}% | TP +{self.take_profit_percent}% | Early TP +{self.early_take_profit_percent}%")
         print(f"   📦 Количество: {quantity:.6f}")
         
-        # ОЖИДАЕМ РЕАЛЬНОГО ДВИЖЕНИЯ ЦЕНЫ
+        # РАССЧИТЫВАЕМ И ВЫВОДИМ ЦЕЛЕВЫЕ ЦЕНЫ ДЛЯ ИНФОРМАЦИИ
+        stop_loss_price = self.calculate_price_from_pnl(entry_price, -self.max_loss_percent, opportunity['signal'])
+        take_profit_price = self.calculate_price_from_pnl(entry_price, self.take_profit_percent, opportunity['signal'])
+        early_take_profit_price = self.calculate_price_from_pnl(entry_price, self.early_take_profit_percent, opportunity['signal'])
+        
+        print(f"   🎯 ЦЕЛЕВЫЕ ЦЕНЫ:")
+        print(f"   🛡️ Стоп-лосс: {stop_loss_price:.4f} (-{self.max_loss_percent}%)")
+        print(f"   🎯 Тейк-профит: {take_profit_price:.4f} (+{self.take_profit_percent}%)")
+        print(f"   ⚡ Ранний тейк: {early_take_profit_price:.4f} (+{self.early_take_profit_percent}%)")
+        
+        # ОЖИДАЕМ РЕАЛЬНОГО ДВИЖЕНИЯ ЦЕНЫ (теперь без передачи TP/SL цен)
         exit_price, exit_reason = self.wait_for_price_movement(
-            opportunity['symbol'], entry_price, stop_loss, take_profit, opportunity['signal']
+            opportunity['symbol'], entry_price, opportunity['signal']
         )
         
         # Расчет PnL
@@ -319,6 +342,9 @@ class MicroLiquidityHunter:
         }
     
     def calculate_aggressive_targets(self, symbol, current_price, signal, confidence):
+        """Теперь эта функция используется только для определения confidence"""
+        # Эта функция больше не рассчитывает TP/SL, так как теперь используем PnL-проценты
+        # Но оставляем для совместимости с остальным кодом
         volatility_map = {
             'BTCUSDT': 0.025, 'ETHUSDT': 0.030, 'BNBUSDT': 0.035, 
             'ADAUSDT': 0.045, 'DOTUSDT': 0.040, 'LINKUSDT': 0.042,
@@ -330,6 +356,7 @@ class MicroLiquidityHunter:
         confidence_boost = (confidence / 100) * 0.5
         volatility = base_volatility * (1 + confidence_boost)
         
+        # Возвращаем фиктивные значения, так как TP/SL теперь рассчитываются через PnL
         if signal == 'BUY':
             take_profit = current_price * (1 + volatility)
             stop_loss = current_price * (1 - volatility * 0.6)
@@ -348,8 +375,8 @@ class MicroLiquidityHunter:
             nearest_support = liquidity['supports'][0] if liquidity['supports'] else None
             nearest_resistance = liquidity['resistances'][0] if liquidity['resistances'] else None
             
-            support_distance = ((current_price - nearest_support) / current_price * 100) if nearest_support else None
-            resistance_distance = ((nearest_resistance - current_price) / current_price * 100) if nearest_resistance else None
+            support_distance = ((current_price - nearest_support) / current_price * 100)
+            resistance_distance = ((nearest_resistance - current_price) / current_price * 100)
             
             opportunity = {
                 'symbol': symbol, 'current_price': current_price, 'trend': market_structure['trend'],
@@ -381,7 +408,10 @@ class MicroLiquidityHunter:
         print(f"🚀 Запуск МИКРО-торговой сессии с РЕАЛЬНЫМИ данными")
         print(f"💰 Начальный демо-баланс: ${self.initial_balance:.2f}")
         print(f"🔄 Количество циклов: {max_cycles}")
-        print("⚡ СТРАТЕГИЯ: АДАПТИВНЫЙ РАЗМЕР + МИКРО-МАРТИНГЕЙЛ + PnL-СТОПЫ")
+        print(f"⚡ НАСТРОЙКИ РИСК-МЕНЕДЖМЕНТА:")
+        print(f"   🛡️ Макс. убыток: {self.max_loss_percent}%")
+        print(f"   🎯 Тейк-профит: {self.take_profit_percent}%") 
+        print(f"   ⚡ Ранний тейк: {self.early_take_profit_percent}%")
         print("📊 РЕЖИМ: МИКРО-ДЕМО-СЧЕТ с РЕАЛЬНЫМИ ЦЕНАМИ")
         print("-" * 70)
         
@@ -410,12 +440,12 @@ class MicroLiquidityHunter:
                     time.sleep(0.05)
                 except Exception as e:
                     continue
-            
+
+            total_cycle_pnl = 0
             if opportunities:
                 opportunities.sort(key=lambda x: x['confidence'], reverse=True)
                 
                 print(f"🎯 Найдено {len(opportunities)} сделок:")
-                total_cycle_pnl = 0
                 
                 for opp in opportunities:
                     trade_result = self.execute_real_trade(opp)
@@ -522,7 +552,17 @@ if __name__ == "__main__":
         'TRXUSDT', 'MATICUSDT', 'ATOMUSDT', 'FILUSDT', 'ETCUSDT'
     ]
     
-    # Запускаем с любым депозитом - код сам адаптируется
-    hunter = MicroLiquidityHunter(initial_balance=28.36)  # Или 50, или 100, или 1000
+    # НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
+    INITIAL_BALANCE = 28.36
+    MAX_LOSS_PERCENT = 0.20
+    TAKE_PROFIT_PERCENT = 0.10
+    EARLY_TAKE_PROFIT_PERCENT = 1
+    
+    hunter = MicroLiquidityHunter(
+        initial_balance=INITIAL_BALANCE,
+        max_loss_percent=MAX_LOSS_PERCENT,
+        take_profit_percent=TAKE_PROFIT_PERCENT,
+        early_take_profit_percent=EARLY_TAKE_PROFIT_PERCENT
+    )
     hunter.scan_and_trade(symbols, max_cycles=5)
     hunter.generate_final_report()
